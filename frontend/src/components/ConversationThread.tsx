@@ -217,7 +217,7 @@ function ThinkingTimeline({ events }: { events: MonitorMessage[] }) {
             </div>
             <p>{event.message}</p>
             {event.event === "assistant_call" ||
-            event.event === "tool_start" ? (
+              event.event === "tool_start" ? (
               <code>{JSON.stringify(event.data)}</code>
             ) : null}
           </div>
@@ -322,7 +322,7 @@ function AssistantMessage({
       <div className="message-avatar">AI</div>
       <div className="message-bubble">
         <div className="message-meta">
-          <span>DeepSearch Agents</span>
+          <span>智研搜</span>
           <time>{syncLabel}</time>
         </div>
 

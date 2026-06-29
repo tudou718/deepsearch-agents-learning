@@ -1,26 +1,25 @@
-# DeepSearch Agents Frontend
+# 智研搜前端
 
-React + Vite + Tailwind CSS + Ant Design frontend for the DeepSearch Agents FastAPI backend.
+React + Vite + Ant Design 前端项目，对接 FastAPI + WebSocket 后端。
 
-## Run
+## 启动
 
 ```bash
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
-By default the app talks to `http://localhost:8000` and `ws://localhost:8000`.
-Override with `.env.local`:
+## 构建
 
 ```bash
+npm run build
+```
+
+## 配置
+
+在 `frontend/.env.local` 中配置后端地址：
+
+```
 VITE_API_BASE_URL=http://localhost:8000
 VITE_WS_BASE_URL=ws://localhost:8000
 ```
-
-## Backend Contract
-
-- `POST /api/task`
-- `POST /api/upload`
-- `GET /api/files`
-- `GET /api/download`
-- `WebSocket /ws/{thread_id}`
