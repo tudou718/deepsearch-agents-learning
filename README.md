@@ -33,53 +33,176 @@
 
 ## 系统架构
 
+### 总体分层
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│  前端 (React + Vite + Ant Design)                       │
-│  对话输入 · 事件流 · 文件下载 · 历史会话                  │
-└────────────────────────┬────────────────────────────────┘
-                         │ HTTP + WebSocket
-┌────────────────────────▼────────────────────────────────┐
-│  后端 (FastAPI)                                         │
-│  POST /api/task · POST /api/upload · GET /api/files     │
-│  GET /api/download · WS /ws/{thread_id}                 │
-│  ToolMonitor 事件聚合 · ContextVar 会话隔离              │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│  智能体层 (DeepAgents + LangGraph)                      │
-│  主 Agent 路由调度                                       │
-│    ├── 网络搜索子 Agent (Tavily)                         │
-│    ├── 数据库查询子 Agent (MySQL: 查表→预览→执行 SQL)    │
-│    └── RAGFlow 知识库子 Agent (文档问答)                 │
-│  主 Agent 持有的文件工具：读取附件 / 生成 Markdown / PDF │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  前端（React + Vite + Ant Design）                            │
+│  对话输入 · 工具事件流 · 文件下载 · localStorage 会话持久化     │
+└────────────────────────────┬─────────────────────────────────┘
+                             │ HTTP（命令）+ WebSocket（进度）
+┌────────────────────────────▼─────────────────────────────────┐
+│  后端 API（FastAPI）                                          │
+│  ├── POST /api/task             → 创建 session_dir 并提交任务 │
+│  ├── POST /api/upload           → 文件存到 updated/{thread}   │
+│  ├── GET  /api/files            → 列出 output/{thread} 文件   │
+│  ├── GET  /api/download         → 安全下载生成文件            │
+│  └── WS   /ws/{thread_id}       → 实时推送事件与结果          │
+│                                                               │
+│  ├── context.py（ContextVar） → 线程级隔离 thread_id / dir    │
+│  └── monitor.py（ToolMonitor）→ 聚合 tool / assistant / result│
+└────────────────────────────┬─────────────────────────────────┘
+                             │ Python 函数调用
+┌────────────────────────────▼─────────────────────────────────┐
+│  智能体调度层（DeepAgents + LangGraph）                        │
+│  main_agent.py                                                │
+│    ├── create_deep_agent(worker=子智能体字典, tools=文件工具)  │
+│    └── run_deep_agent → 异步 astream 事件流                    │
+│                                                               │
+│  ┌─ 网络搜索子 Agent ── Tavily internet_search                │
+│  ├─ 数据库查询子 Agent ── 查表 → 预览结构 → 生成 SQL → 执行     │
+│  └─ RAGFlow 知识库子 Agent ── 助手列表 → 临时会话问答           │
+│                                                               │
+│  主 Agent 持有的文件工具：                                     │
+│    ├── read_file_content（读取上传附件）                       │
+│    ├── generate_markdown（总结信息生成报告）                   │
+│    └── convert_md_to_pdf（Markdown 转 PDF）                    │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+### 典型数据流（一次完整任务）
+
+```
+① 用户在前端输入任务 + 上传附件（可选）
+   │
+   ├── HTTP POST /api/upload ──→ 文件落盘 updated/{thread_id}/
+   └── HTTP POST /api/task  ──→ 后端创建 session_dir
+                                提交任务到 asyncio.create_task
+                                立即返回 202 Accepted
+                                │
+② 后端后台协程调用 run_deep_agent(query, files, ...)
+   │
+   ├─ 主 Agent 理解任务，判断信息缺口
+   ├─ 调度网络搜索子 Agent → 查询公开资料
+   ├─ 或调度数据库查询子 Agent → 发现表→预览结构→生成 SQL→执行
+   ├─ 或调度 RAGFlow 知识库子 Agent → 查找内部文档
+   ├─ 或读取用户上传文件 → 提取内容
+   │
+③ 每个工具/子 Agent 调用时，monitor.py 上报事件：
+   ├── tool_start / tool_end
+   ├── assistant_call
+   ├── task_result / error
+   │ 通过 WebSocket /ws/{thread_id} 实时推给前端
+   │
+④ 信息收集完毕后，主 Agent 调用 generate_markdown：
+   ├─ 将对话历史整理为结构化 Markdown
+   ├─ 写入 output/{session_dir}/report.md
+   └─ 可选：convert_md_to_pdf 生成 PDF
+   │
+⑤ 前端接收 WebSocket 事件，渲染工具执行流和最终答案。
+   用户可在"文件"区域下载 Markdown / PDF。
+```
+
+### 核心组件职责
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| **会话入口** | `app/api/server.py` | FastAPI 生命周期 + 路由定义 + WebSocket 连接管理 |
+| **会话上下文** | `app/api/context.py` | `ContextVar` 保存当前 thread_id 和 session_dir，深层工具无需层层传参 |
+| **事件上报** | `app/api/monitor.py` | 订阅 DeepAgents 事件流，整理后推送到对应用户的 WebSocket |
+| **主智能体** | `app/agent/main_agent.py` | 组装 create_deep_agent，定义子智能体字典和文件工具集，暴露 `run_deep_agent` |
+| **子智能体** | `app/agent/subagents/` | 每个子智能体持有自己的 LLM、工具和提示词，只负责一类信息来源 |
+| **工具层** | `app/tools/` | Tavily 搜索、MySQL 查询、RAGFlow 会话、Markdown/PDF 生成的底层实现 |
+| **提示词** | `app/prompt/prompts.yml` | 主/子智能体的 system prompt 与指令配置 |
+
+### 数据库查询子 Agent 链路
+
+这是最能体现"智能而非裸调用"的部分：
+
+```
+用户问："帮我查一下最近一个季度心血管药品的库存情况"
+  │
+  ├─ 1. list_sql_tables  → 返回所有表名
+  ├─ 2. get_table_data  → 预览库存表前 5 行，理解字段含义
+  ├─ 3. LLM 根据表结构生成 SQL（带参数绑定占位符）
+  └─ 4. execute_sql_query → 执行并返回结果集
+                              ↑
+                         全程经过 monitor.py 上报
+```
+
+### 会话隔离设计
+
+- 每个任务分配唯一 `thread_id`（UUID）
+- 上传文件目录：`updated/{thread_id}/`
+- 输出文件目录：`output/{session_dir}/`
+- `context.py` 用 `ContextVar` 在线程/协程级绑定这两个 ID，深层工具无需显式传入
+- 前端 `sessionStore.ts` 用 localStorage 按 thread_id 持久化 turns / events，实现刷新恢复和多会话切换
 
 ### 项目结构
 
 ```text
 deepsearch-agents/
-├── app/
-│   ├── agent/
-│   │   ├── subagents/           # 网络搜索、数据库查询、RAGFlow 三个子智能体
-│   │   ├── llm.py               # 模型初始化（OpenAI 兼容接口）
-│   │   ├── main_agent.py        # 主智能体组装与 run_deep_agent 执行入口
-│   │   └── prompts.py           # 从 app/prompt/prompts.yml 加载提示词
-│   ├── api/
-│   │   ├── context.py           # ContextVar 保存 thread_id 和 session_dir
-│   │   ├── monitor.py           # 工具/子智能体调用事件统一上报
-│   │   └── server.py            # FastAPI 任务/上传/文件/WebSocket 接口
-│   ├── tools/                   # Tavily、MySQL、RAGFlow、Markdown、PDF 工具
-│   ├── utils/                   # 路径安全解析、Markdown/PDF 底层转换
-│   └── prompt/prompts.yml       # 主/子智能体提示词配置
-├── docker/
-│   ├── docker-compose.yaml      # MySQL 教学环境
-│   └── mysql/mysql.sql          # 药品/库存/销售记录模拟数据
-├── frontend/                    # React + Vite 前端项目
-├── examples/                    # DeepAgents 章节示例脚本
-├── .env.example                 # 环境变量示例
-└── pyproject.toml
+│
+├── app/                                    ── Python 后端核心
+│   ├── agent/                            智能体组装
+│   │   ├── subagents/                    三个子智能体（各有独立 LLM + 工具）
+│   │   │   ├── network_search_agent.py     网络搜索子 Agent（Tavily）
+│   │   │   ├── database_query_agent.py     数据库查询子 Agent（MySQL）
+│   │   │   └── knowledge_base_agent.py    RAGFlow 知识库子 Agent
+│   │   ├── llm.py                        模型初始化（OpenAI 兼容）
+│   │   ├── main_agent.py                 主 Agent：组装 + run_deep_agent
+│   │   └── prompts.py                      从 prompts.yml 加载提示词
+│   ├── api/                              FastAPI 层
+│   │   ├── server.py                     路由：task / upload / files / download / ws
+│   │   ├── context.py                     ContextVar：thread_id / session_dir
+│   │   └── monitor.py                    ToolMonitor：事件聚合→WebSocket
+│   ├── tools/                            工具层（主 Agent 和子 Agent 调用）
+│   │   ├── tavily_tool.py               联网搜索
+│   │   ├── db_tools.py                    list_sql_tables / get_table_data / execute_sql_query
+│   │   ├── ragflow_tools.py               知识库助手列表 + 临时会话问答
+│   │   ├── upload_file_read_tool.py          读取用户上传文件（PDF/Word/Excel/MD）
+│   │   ├── markdown_tools.py                generate_markdown 生成报告
+│   │   └── pdf_tools.py                     convert_md_to_pdf 转 PDF
+│   ├── utils/                             工具函数
+│   │   ├── path_utils.py                   路径安全解析（防越权下载）
+│   │   └── word_converter.py                 .docx 转纯文本
+│   ├── prompt/prompts.yml                 主/子 Agent 的 system prompt 配置
+│   └── ragflow/                          RAGFlow 调试示例（可选使用）
+│
+├── docker/                               Docker 部署辅助
+│   ├── docker-compose.yaml               MySQL 8.4 容器（含 healthcheck）
+│   └── mysql/mysql.sql                   模拟数据：药品/库存/销售记录
+│
+├── frontend/                              React + Vite 前端
+│   └── src/
+│       ├── App.tsx                        主界面：侧边栏会话列表 + 对话区
+│       ├── main.tsx                       入口
+│       ├── types.ts                        TypeScript 类型定义
+│       ├── styles.css                      全局样式
+│       ├── hooks/
+│       │   └── useDeepAgentSession.ts         会话状态 Hook：管理 turns/events/files + WebSocket
+│       ├── lib/
+│       │   ├── api.ts                        HTTP 请求封装（task/upload/files/download）
+│       │   ├── config.ts                    API / WS 地址配置（读取 .env）
+│       │   ├── thread.ts                    thread_id 生成与 localStorage 存储
+│       │   └── sessionStore.ts            多会话持久化：localStorage 读写/恢复
+│       └── components/                     UI 组件
+│           ├── ConversationThread.tsx          对话历史 + 事件流折叠面板
+│           ├── ChatComposer.tsx            任务输入框
+│           ├── EventStream.tsx               工具/子 Agent 调用事件列表
+│           ├── UploadPanel.tsx             文件上传面板
+│           ├── FileDock.tsx                 已上传文件 + 生成文件下载
+│           ├── ResultPanel.tsx              Markdown 结果渲染区
+│           ├── MarkdownRenderer.tsx        安全的 Markdown 渲染器
+│           ├── StatusStrip.tsx               连接/模型状态条
+│           ├── MissionComposer.tsx          任务配置面板（可选）
+│           └── AgentTopology.tsx           智能体架构示意图
+│
+├── examples/                            DeepAgents 框架入门示例脚本
+├── docs/knowledge_base/                 RAGFlow 示例 PDF（电商/金融）
+├── .env.example                        环境变量模板（API Key / 数据库配置）
+├── pyproject.toml                      Python 项目配置与依赖声明
+└── README.md
 ```
 
 ---
